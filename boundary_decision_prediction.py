@@ -175,7 +175,11 @@ def plot_boundaries(df: pd.DataFrame, radii: np.ndarray,
     theta_full = np.linspace(0, 2 * np.pi, 500)
     r_outer = _data_extent(df, radii, center)
     all_bounds = [0.0] + list(radii) + [r_outer]
-    for i in range(4):
+
+    ax.fill(cx + all_bounds[1] * np.cos(theta_full),
+            cy + all_bounds[1] * np.sin(theta_full),
+            color=CLASS_COLORS[1], alpha=0.10, zorder=1)
+    for i in range(1, 4):
         r_in, r_out = all_bounds[i], all_bounds[i + 1]
         x_o = cx + r_out * np.cos(theta_full)
         y_o = cy + r_out * np.sin(theta_full)
@@ -369,7 +373,11 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
     theta_full = np.linspace(0, 2 * np.pi, 500)
     r_outer = _data_extent(df, radii, center)
     all_bounds = [0.0] + list(radii) + [r_outer]
-    for i in range(4):
+
+    ax1.fill(cx + all_bounds[1] * np.cos(theta_full),
+             cy + all_bounds[1] * np.sin(theta_full),
+             color=CLASS_COLORS[1], alpha=0.08, zorder=1)
+    for i in range(1, 4):
         r_in, r_out = all_bounds[i], all_bounds[i + 1]
         x_o = cx + r_out * np.cos(theta_full)
         y_o = cy + r_out * np.sin(theta_full)
