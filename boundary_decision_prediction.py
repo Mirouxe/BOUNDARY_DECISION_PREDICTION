@@ -3,11 +3,13 @@ Boundary Decision Prediction — Circular boundary classification
 with ordinal probability estimation.
 
 Classifies data points (I, F) into 4 ordered exposure classes (E)
-separated by full-circle boundaries in the 2D plane (any quadrant).
+separated by concentric circle boundaries centred on a user-defined
+point (default: centroid of class 1).
 
 Step 1: Optimal radii found by minimising classification error.
-Step 2: Cumulative ordinal logistic regression on r = sqrt(I²+F²)
-        yields calibrated class probabilities P(E=k | I, F).
+Step 2: Cumulative ordinal logistic regression on
+        r = sqrt((I-I0)²+(F-F0)²) yields calibrated class
+        probabilities P(E=k | I, F).
 """
 
 import numpy as np
@@ -15,6 +17,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.optimize import minimize
+from itertools import combinations
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -28,8 +31,7 @@ def generate_dataset(n_total: int = 54, seed: int = 42,
     by three concentric circles of true radii r1 < r2 < r3.
 
     If *full_plane* is True the points are spread over all quadrants
-    (θ ∈ [0, 2π]); otherwise they are restricted to the first quadrant
-    (θ ∈ [0, π/2]) for backward compatibility.
+    (θ ∈ [0, 2π]); otherwise they are restricted to the first quadrant.
     """
     rng = np.random.default_rng(seed)
 
@@ -60,50 +62,65 @@ def generate_dataset(n_total: int = 54, seed: int = 42,
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _dist_to_center(I: np.ndarray, F: np.ndarray,
+                    center: tuple[float, float]) -> np.ndarray:
+    """Euclidean distance from each point to *center*."""
+    return np.sqrt((I - center[0])**2 + (F - center[1])**2)
+
+
+def compute_default_center(df: pd.DataFrame) -> tuple[float, float]:
+    """Return the centroid of class E = 1 (lowest exposure)."""
+    c1 = df[df["E"] == df["E"].min()]
+    return float(c1["I"].mean()), float(c1["F"].mean())
+
+
+# ---------------------------------------------------------------------------
 # 2. Optimal circle-boundary fitting
 # ---------------------------------------------------------------------------
 
 def classify_by_radii(I: np.ndarray, F: np.ndarray,
-                      radii: np.ndarray) -> np.ndarray:
-    """Assign class labels 1..4 based on distance to origin and 3 radii."""
-    dist = np.sqrt(I**2 + F**2)
+                      radii: np.ndarray,
+                      center: tuple[float, float] = (0.0, 0.0)) -> np.ndarray:
+    """Assign class labels 1..4 based on distance to *center* and 3 radii."""
+    dist = _dist_to_center(I, F, center)
     labels = np.ones(len(dist), dtype=int)
     for k, r in enumerate(sorted(radii)):
         labels[dist > r] = k + 2
     return labels
 
 
-def fit_circle_boundaries(df: pd.DataFrame, n_classes: int = 4):
+def fit_circle_boundaries(df: pd.DataFrame,
+                          center: tuple[float, float] = (0.0, 0.0),
+                          n_classes: int = 4):
     """
     Find the (n_classes-1) radii that best separate the classes
-    by minimising the misclassification rate.
-    The initial grid adapts to the data extent.
+    around *center* by minimising the misclassification rate.
     """
     I = df["I"].values
     F = df["F"].values
     y_true = df["E"].values
 
-    r_max = np.sqrt(I**2 + F**2).max()
+    r_max = _dist_to_center(I, F, center).max()
 
     def objective(params):
         radii = np.sort(params)
-        y_pred = classify_by_radii(I, F, radii)
+        y_pred = classify_by_radii(I, F, radii, center)
         error = np.mean(y_pred != y_true)
         penalty = 1e3 * np.sum(np.maximum(0, -np.diff(radii)))
         return error + penalty
 
     n_boundaries = n_classes - 1
-    grid_points = 6
-    grid = np.linspace(0.5, r_max * 0.95, grid_points * n_boundaries)
+    grid = np.linspace(0.5, r_max * 0.95, 6 * n_boundaries)
 
     best_result = None
-    from itertools import combinations
     for combo in combinations(grid, n_boundaries):
         combo = sorted(combo)
         if any(combo[i] >= combo[i + 1] for i in range(len(combo) - 1)):
             continue
-        x0 = list(combo)
-        res = minimize(objective, x0, method="Nelder-Mead",
+        res = minimize(objective, list(combo), method="Nelder-Mead",
                        options={"maxiter": 5000, "xatol": 1e-6})
         if best_result is None or res.fun < best_result.fun:
             best_result = res
@@ -121,58 +138,61 @@ CLASS_COLORS = {1: "#1b9e77", 2: "#d95f02", 3: "#7570b3", 4: "#e7298a"}
 CLASS_MARKERS = {1: "o", 2: "s", 3: "^", 4: "D"}
 
 
-def _data_extent(df: pd.DataFrame, radii: np.ndarray, margin: float = 1.5):
-    """Compute symmetric axis limits that encompass data + outer boundary."""
-    r_outer = max(radii.max(),
-                  np.sqrt(df["I"].values**2 + df["F"].values**2).max()) + margin
+def _data_extent(df: pd.DataFrame, radii: np.ndarray,
+                 center: tuple[float, float], margin: float = 1.5):
+    """Compute the outer radius that encompasses data + outer boundary."""
+    r_outer = max(
+        radii.max(),
+        _dist_to_center(df["I"].values, df["F"].values, center).max()
+    ) + margin
     return r_outer
 
 
 def plot_boundaries(df: pd.DataFrame, radii: np.ndarray,
-                    accuracy: float, save_path: str = "boundary_plot.png"):
+                    accuracy: float,
+                    center: tuple[float, float] = (0.0, 0.0),
+                    save_path: str = "boundary_plot.png"):
     """Scientific-quality 2D scatter with full-circle boundaries."""
 
     plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 11,
+        "font.family": "serif", "font.size": 11,
         "axes.linewidth": 0.8,
-        "xtick.direction": "in",
-        "ytick.direction": "in",
-        "xtick.major.size": 4,
-        "ytick.major.size": 4,
+        "xtick.direction": "in", "ytick.direction": "in",
+        "xtick.major.size": 4, "ytick.major.size": 4,
         "figure.dpi": 150,
     })
 
+    cx, cy = center
     fig, ax = plt.subplots(figsize=(7.5, 7))
 
     for cls in sorted(df["E"].unique()):
         subset = df[df["E"] == cls]
         ax.scatter(subset["I"], subset["F"],
-                   c=CLASS_COLORS[cls],
-                   marker=CLASS_MARKERS[cls],
+                   c=CLASS_COLORS[cls], marker=CLASS_MARKERS[cls],
                    s=60, edgecolors="k", linewidths=0.5,
                    label=CLASS_LABELS[cls], zorder=5)
 
     theta_full = np.linspace(0, 2 * np.pi, 500)
-    r_outer = _data_extent(df, radii)
+    r_outer = _data_extent(df, radii, center)
     all_bounds = [0.0] + list(radii) + [r_outer]
     for i in range(4):
         r_in, r_out = all_bounds[i], all_bounds[i + 1]
-        x_o = r_out * np.cos(theta_full)
-        y_o = r_out * np.sin(theta_full)
-        x_i = r_in * np.cos(theta_full[::-1])
-        y_i = r_in * np.sin(theta_full[::-1])
+        x_o = cx + r_out * np.cos(theta_full)
+        y_o = cy + r_out * np.sin(theta_full)
+        x_i = cx + r_in * np.cos(theta_full[::-1])
+        y_i = cy + r_in * np.sin(theta_full[::-1])
         ax.fill(np.concatenate([x_o, x_i]),
                 np.concatenate([y_o, y_i]),
                 color=CLASS_COLORS[i + 1], alpha=0.10, zorder=1)
 
     for k, r in enumerate(radii):
-        x_c = r * np.cos(theta_full)
-        y_c = r * np.sin(theta_full)
+        x_c = cx + r * np.cos(theta_full)
+        y_c = cy + r * np.sin(theta_full)
         ax.plot(x_c, y_c, color="k", linewidth=1.2, linestyle="--", zorder=4)
         ax.annotate(
             f"$r_{k+1} = {r:.2f}$",
-            xy=(r * np.cos(np.pi / 4), r * np.sin(np.pi / 4)),
+            xy=(cx + r * np.cos(np.pi / 4),
+                cy + r * np.sin(np.pi / 4)),
             xytext=(12, 12), textcoords="offset points",
             fontsize=9, fontstyle="italic",
             arrowprops=dict(arrowstyle="->", color="grey", lw=0.8),
@@ -180,9 +200,22 @@ def plot_boundaries(df: pd.DataFrame, radii: np.ndarray,
                       ec="grey", alpha=0.9),
             zorder=6)
 
-    lim = r_outer + 0.5
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
+    ax.plot(cx, cy, marker="+", ms=14, mew=2.5, color="red", zorder=8)
+    ax.annotate(f"centre ({cx:.2f}, {cy:.2f})",
+                xy=(cx, cy), xytext=(14, -14),
+                textcoords="offset points", fontsize=8.5,
+                color="red", fontweight="bold", zorder=8)
+
+    all_I = df["I"].values
+    all_F = df["F"].values
+    pad = 1.0
+    xlim_lo = min(all_I.min(), cx - r_outer) - pad
+    xlim_hi = max(all_I.max(), cx + r_outer) + pad
+    ylim_lo = min(all_F.min(), cy - r_outer) - pad
+    ylim_hi = max(all_F.max(), cy + r_outer) + pad
+    ax.set_xlim(xlim_lo, xlim_hi)
+    ax.set_ylim(ylim_lo, ylim_hi)
+
     ax.axhline(0, color="k", lw=0.4, zorder=2)
     ax.axvline(0, color="k", lw=0.4, zorder=2)
     ax.set_xlabel("$I$", fontsize=13)
@@ -196,14 +229,14 @@ def plot_boundaries(df: pd.DataFrame, radii: np.ndarray,
 
     acc_text = f"Accuracy = {accuracy:.1%}"
     eq_lines = "\n".join(
-        [f"$r_{k+1}$: $I^2 + F^2 = {r**2:.2f}$  ($r = {r:.2f}$)"
+        [f"$r_{k+1}$: $(I-I_0)^2+(F-F_0)^2 = {r**2:.2f}$"
          for k, r in enumerate(radii)])
-    info_text = f"{acc_text}\n\nBoundary equations:\n{eq_lines}"
+    center_text = f"Centre $(I_0, F_0) = ({cx:.2f},\\;{cy:.2f})$"
+    info_text = f"{acc_text}\n{center_text}\n\nBoundary equations:\n{eq_lines}"
     ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
             fontsize=8.5, verticalalignment="top",
             bbox=dict(boxstyle="round,pad=0.5", fc="lightyellow",
-                      ec="grey", alpha=0.9),
-            zorder=7)
+                      ec="grey", alpha=0.9), zorder=7)
 
     ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.6)
     fig.tight_layout()
@@ -255,12 +288,13 @@ def ordinal_neg_log_likelihood(params, r, y, K=4):
     return nll
 
 
-def fit_ordinal_logistic(df: pd.DataFrame, radii: np.ndarray):
+def fit_ordinal_logistic(df: pd.DataFrame, radii: np.ndarray,
+                         center: tuple[float, float] = (0.0, 0.0)):
     """
-    Fit a cumulative ordinal logistic model on r = sqrt(I² + F²).
-    Initial thresholds are derived from the previously fitted radii.
+    Fit a cumulative ordinal logistic model on
+    r = sqrt((I-I0)² + (F-F0)²).
     """
-    r = np.sqrt(df["I"].values**2 + df["F"].values**2)
+    r = _dist_to_center(df["I"].values, df["F"].values, center)
     y = df["E"].values
     K = 4
 
@@ -308,47 +342,46 @@ EXPOSURE_LABELS = {
 def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
                                alpha: np.ndarray, beta: float,
                                accuracy: float,
+                               center: tuple[float, float] = (0.0, 0.0),
                                save_path: str = "probability_plot.png"):
     """
     Two-panel figure:
-      Left  – 2D scatter (full plane) with colour = true class,
-              size proportional to max probability (confidence).
+      Left  – 2D scatter with colour = true class, size ∝ confidence.
       Right – P(E=k | r) curves as a function of r.
     """
     plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 11,
+        "font.family": "serif", "font.size": 11,
         "axes.linewidth": 0.8,
-        "xtick.direction": "in",
-        "ytick.direction": "in",
-        "xtick.major.size": 4,
-        "ytick.major.size": 4,
+        "xtick.direction": "in", "ytick.direction": "in",
+        "xtick.major.size": 4, "ytick.major.size": 4,
         "figure.dpi": 150,
     })
 
-    r_data = np.sqrt(df["I"].values**2 + df["F"].values**2)
+    cx, cy = center
+    r_data = _dist_to_center(df["I"].values, df["F"].values, center)
     probs_data = ordinal_cumulative_probs(r_data, alpha, beta)
     max_prob = probs_data.max(axis=1)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14.5, 6.5),
                                     gridspec_kw={"width_ratios": [1, 1.05]})
 
-    # --- Left panel: 2D scatter with confidence ---
+    # --- Left panel ---
     theta_full = np.linspace(0, 2 * np.pi, 500)
-    r_outer = _data_extent(df, radii)
+    r_outer = _data_extent(df, radii, center)
     all_bounds = [0.0] + list(radii) + [r_outer]
     for i in range(4):
         r_in, r_out = all_bounds[i], all_bounds[i + 1]
-        x_o = r_out * np.cos(theta_full)
-        y_o = r_out * np.sin(theta_full)
-        x_i = r_in * np.cos(theta_full[::-1])
-        y_i = r_in * np.sin(theta_full[::-1])
+        x_o = cx + r_out * np.cos(theta_full)
+        y_o = cy + r_out * np.sin(theta_full)
+        x_i = cx + r_in * np.cos(theta_full[::-1])
+        y_i = cy + r_in * np.sin(theta_full[::-1])
         ax1.fill(np.concatenate([x_o, x_i]),
                  np.concatenate([y_o, y_i]),
                  color=CLASS_COLORS[i + 1], alpha=0.08, zorder=1)
 
     for k, rv in enumerate(radii):
-        ax1.plot(rv * np.cos(theta_full), rv * np.sin(theta_full),
+        ax1.plot(cx + rv * np.cos(theta_full),
+                 cy + rv * np.sin(theta_full),
                  color="k", lw=1.0, ls="--", alpha=0.5, zorder=3)
 
     sizes = 30 + 120 * (max_prob - max_prob.min()) / \
@@ -360,9 +393,15 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
                     s=sizes[mask], edgecolors="k", linewidths=0.4,
                     label=EXPOSURE_LABELS[cls], zorder=5)
 
-    lim = r_outer + 0.5
-    ax1.set_xlim(-lim, lim)
-    ax1.set_ylim(-lim, lim)
+    ax1.plot(cx, cy, marker="+", ms=12, mew=2, color="red", zorder=8)
+
+    all_I = df["I"].values
+    all_F = df["F"].values
+    pad = 1.0
+    ax1.set_xlim(min(all_I.min(), cx - r_outer) - pad,
+                 max(all_I.max(), cx + r_outer) + pad)
+    ax1.set_ylim(min(all_F.min(), cy - r_outer) - pad,
+                 max(all_F.max(), cy + r_outer) + pad)
     ax1.axhline(0, color="k", lw=0.4, zorder=2)
     ax1.axvline(0, color="k", lw=0.4, zorder=2)
     ax1.set_xlabel("$I$", fontsize=13)
@@ -375,7 +414,7 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
                edgecolor="grey", title="Exposition", title_fontsize=9.5)
     ax1.grid(True, ls=":", lw=0.4, alpha=0.5)
 
-    # --- Right panel: P(E=k | r) curves ---
+    # --- Right panel ---
     r_max_plot = r_data.max() * 1.3
     r_smooth = np.linspace(0, r_max_plot, 500)
     probs_smooth = ordinal_cumulative_probs(r_smooth, alpha, beta)
@@ -390,7 +429,7 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
         ax2.axvline(rv, color="grey", lw=0.8, ls=":", alpha=0.6)
 
     for i, row in df.iterrows():
-        ri = np.sqrt(row["I"]**2 + row["F"]**2)
+        ri = np.sqrt((row["I"] - cx)**2 + (row["F"] - cy)**2)
         cls = int(row["E"])
         prob_k = probs_data[i, cls - 1]
         ax2.scatter(ri, prob_k, c=CLASS_COLORS[cls],
@@ -398,7 +437,8 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
                     s=30, edgecolors="k", linewidths=0.3,
                     zorder=5, alpha=0.7)
 
-    ax2.set_xlabel("$r = \\sqrt{I^2 + F^2}$", fontsize=13)
+    ax2.set_xlabel(
+        "$r = \\sqrt{(I-I_0)^2 + (F-F_0)^2}$", fontsize=13)
     ax2.set_ylabel("$P(E = k \\mid r)$", fontsize=13)
     ax2.set_title("Probabilités ordinales cumulatives\n"
                   "Régression logistique ordinale",
@@ -409,13 +449,14 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
                edgecolor="grey", title="Exposition", title_fontsize=9.5)
     ax2.grid(True, ls=":", lw=0.4, alpha=0.5)
 
-    eq_text = (f"$P(E \\leq k \\mid r) = \\sigma(\\alpha_k - \\beta \\, r)$"
-               f"\n\n"
-               f"$\\alpha_1 = {alpha[0]:.3f}$\n"
-               f"$\\alpha_2 = {alpha[1]:.3f}$\n"
-               f"$\\alpha_3 = {alpha[2]:.3f}$\n"
-               f"$\\beta = {beta:.3f}$\n\n"
-               f"Précision = {accuracy:.1%}")
+    eq_text = (
+        f"$P(E \\leq k \\mid r) = \\sigma(\\alpha_k - \\beta \\, r)$\n"
+        f"$r = \\sqrt{{(I-{cx:.2f})^2 + (F-{cy:.2f})^2}}$\n\n"
+        f"$\\alpha_1 = {alpha[0]:.3f}$\n"
+        f"$\\alpha_2 = {alpha[1]:.3f}$\n"
+        f"$\\alpha_3 = {alpha[2]:.3f}$\n"
+        f"$\\beta = {beta:.3f}$\n\n"
+        f"Précision = {accuracy:.1%}")
     ax2.text(0.98, 0.98, eq_text, transform=ax2.transAxes,
              fontsize=8.5, verticalalignment="top",
              horizontalalignment="right",
@@ -434,11 +475,14 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal,
+                    center: tuple[float, float] = (0.0, 0.0),
                     save_path="rapport_methode.docx"):
     """Generate a short scientific report in DOCX format."""
     from docx import Document
     from docx.shared import Pt, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    cx, cy = center
 
     doc = Document()
     style = doc.styles["Normal"]
@@ -458,34 +502,37 @@ def generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal,
 
     doc.add_heading("1. Contexte", level=1)
     doc.add_paragraph(
-        "On considère un problème de classification de données bidimensionnelles "
-        "(I, F) en 4 classes ordonnées d'exposition E ∈ {1, 2, 3, 4}, où E = 1 "
-        "correspond à une faible exposition énergétique et E = 4 à une exposition "
-        "très élevée. Les deux variables I et F caractérisent l'exposition. "
-        "Les frontières de séparation sont des cercles concentriques centrés à "
-        "l'origine dans le plan 2D complet (tous quadrants)."
+        "On considère un problème de classification de données "
+        "bidimensionnelles (I, F) en 4 classes ordonnées d'exposition "
+        "E ∈ {1, 2, 3, 4}, où E = 1 correspond à une faible exposition "
+        "énergétique et E = 4 à une exposition très élevée. "
+        "Les frontières de séparation sont des cercles concentriques "
+        f"centrés en un point (I₀, F₀) = ({cx:.4f}, {cy:.4f}), "
+        "choisi par défaut comme le barycentre de la classe 1 "
+        "(exposition la plus faible)."
     )
 
     doc.add_heading("2. Étape 1 — Détermination des frontières", level=1)
     doc.add_paragraph(
         "La variable d'exposition combinée est définie comme la distance "
-        "à l'origine :"
+        "au centre :"
     )
-    doc.add_paragraph("    r = √(I² + F²)", style="No Spacing")
+    doc.add_paragraph(
+        f"    r = √((I − I₀)² + (F − F₀)²)    "
+        f"avec (I₀, F₀) = ({cx:.4f}, {cy:.4f})",
+        style="No Spacing")
     doc.add_paragraph(
         "Les 4 classes sont séparées par 3 cercles concentriques de rayons "
         "r₁ < r₂ < r₃. Les rayons optimaux sont déterminés par minimisation "
-        "du taux de mauvaise classification via l'algorithme de Nelder-Mead "
-        "(scipy.optimize). La méthode fonctionne quel que soit le quadrant "
-        "car seule la distance à l'origine intervient."
+        "du taux de mauvaise classification via Nelder-Mead (scipy.optimize)."
     )
     doc.add_paragraph("Équations des frontières :")
     for k, r in enumerate(radii):
         doc.add_paragraph(
-            f"    Frontière {k+1} :  I² + F² = {r**2:.4f}   "
+            f"    Frontière {k+1} :  "
+            f"(I − I₀)² + (F − F₀)² = {r**2:.4f}   "
             f"(r{k+1} = {r:.4f})",
-            style="No Spacing",
-        )
+            style="No Spacing")
     doc.add_paragraph(
         f"\nPrécision de classification dure : {accuracy_hard:.1%}")
 
@@ -494,13 +541,16 @@ def generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal,
     doc.add_paragraph(
         "Pour obtenir des probabilités d'appartenance à chaque classe, on "
         "utilise un modèle de régression logistique ordinale cumulative "
-        "(proportional odds model). Ce modèle est particulièrement adapté car :"
+        "(proportional odds model). Ce modèle est adapté car :"
     )
     for b in [
-        "Les classes ont un ordre naturel (intensité d'exposition croissante).",
+        "Les classes ont un ordre naturel (intensité d'exposition "
+        "croissante).",
         "La variable latente sous-jacente (l'exposition r) est continue.",
-        "Le modèle garantit la cohérence des probabilités avec l'ordinalité.",
-        "La formulation est invariante par rotation (seul r compte).",
+        "Le modèle garantit la cohérence des probabilités avec "
+        "l'ordinalité.",
+        "La formulation est invariante par rotation autour du centre "
+        "choisi.",
     ]:
         doc.add_paragraph(b, style="List Bullet")
 
@@ -508,14 +558,11 @@ def generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal,
     doc.add_paragraph("Le modèle cumulatif s'écrit :")
     doc.add_paragraph(
         "    P(E ≤ k | r) = σ(αₖ − β · r),    k = 1, 2, 3",
-        style="No Spacing",
-    )
+        style="No Spacing")
     doc.add_paragraph(
         "où σ(x) = 1 / (1 + exp(−x)) est la fonction sigmoïde logistique, "
-        "α₁ < α₂ < α₃ sont les seuils (intercepts) et β > 0 est la pente "
-        "commune (proportional odds assumption). "
-        "La seule variable explicative est r = √(I² + F²), ce qui rend le "
-        "modèle valide quel que soit le signe de I et F."
+        "α₁ < α₂ < α₃ sont les seuils et β > 0 est la pente commune. "
+        "La variable explicative est r = √((I−I₀)² + (F−F₀)²)."
     )
     doc.add_paragraph(
         "Les probabilités par classe se déduisent par différence :")
@@ -529,10 +576,9 @@ def generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal,
 
     doc.add_heading("3.2. Estimation des paramètres", level=2)
     doc.add_paragraph(
-        "Les paramètres sont estimés par maximum de vraisemblance "
-        "(minimisation de la log-vraisemblance négative) via Nelder-Mead. "
-        "Les valeurs initiales des seuils sont dérivées des rayons optimaux "
-        "de l'étape 1 (αₖ⁰ = β⁰ · rₖ)."
+        "Les paramètres sont estimés par maximum de vraisemblance. "
+        "Les valeurs initiales des seuils sont dérivées des rayons "
+        "optimaux de l'étape 1 (αₖ⁰ = β⁰ · rₖ)."
     )
     doc.add_paragraph("Paramètres estimés :")
     for k in range(len(alpha)):
@@ -540,39 +586,41 @@ def generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal,
             f"    α{k+1} = {alpha[k]:.4f}", style="No Spacing")
     doc.add_paragraph(f"    β  = {beta:.4f}", style="No Spacing")
     doc.add_paragraph(
-        f"\nPrécision de la classification par probabilité maximale : "
-        f"{accuracy_ordinal:.1%}"
-    )
+        f"\nPrécision par probabilité maximale : {accuracy_ordinal:.1%}")
 
     doc.add_heading("3.3. Interprétation physique", level=2)
     doc.add_paragraph(
-        "Les seuils αₖ/β correspondent aux rayons de transition entre classes. "
-        "La pente β contrôle la netteté de la transition : "
-        "plus β est grand, plus la transition est abrupte. "
-        "Aux frontières (r ≈ αₖ/β), l'incertitude est maximale, "
-        "ce qui reflète l'ambiguïté physique de classification. "
-        "Cette interprétation est valide dans tout le plan 2D car r est "
-        "invariant par rotation."
+        "Les seuils αₖ/β correspondent aux rayons de transition. "
+        "La pente β contrôle la netteté : plus β est grand, plus la "
+        "transition est abrupte. Aux frontières (r ≈ αₖ/β), l'incertitude "
+        "est maximale."
     )
     r_transitions = alpha / beta
     for k in range(len(alpha)):
         doc.add_paragraph(
             f"    Transition E={k+1}/E={k+2} : "
             f"r = α{k+1}/β = {r_transitions[k]:.4f}",
-            style="No Spacing",
-        )
+            style="No Spacing")
+
+    doc.add_heading("3.4. Choix du centre", level=2)
+    doc.add_paragraph(
+        "Le centre des cercles (I₀, F₀) est configurable par l'utilisateur. "
+        "Par défaut, il est fixé au barycentre de la classe E = 1 "
+        "(exposition la plus faible), ce qui est physiquement cohérent : "
+        "le point de moindre exposition constitue un centre naturel "
+        "autour duquel l'exposition croît radialement."
+    )
 
     doc.add_heading("4. Conclusion", level=1)
     doc.add_paragraph(
-        "La combinaison d'une classification par frontières circulaires et "
-        "d'une régression logistique ordinale fournit un cadre complet pour :\n"
+        "La combinaison d'une classification par frontières circulaires "
+        "centrées et d'une régression logistique ordinale fournit un cadre "
+        "complet pour :\n"
         "  (a) classifier les points en classes d'exposition,\n"
-        "  (b) quantifier l'incertitude de cette classification via des "
-        "probabilités calibrées,\n"
-        "  (c) identifier les zones de transition où l'exposition est ambiguë.\n\n"
-        "La méthode est intrinsèquement invariante par rotation : seule la "
-        "distance à l'origine r = √(I² + F²) détermine la classe. Les données "
-        "peuvent donc se situer dans n'importe quel quadrant du plan 2D."
+        "  (b) quantifier l'incertitude via des probabilités calibrées,\n"
+        "  (c) identifier les zones de transition ambiguës.\n\n"
+        "Le centre des cercles est paramétrable, permettant d'adapter "
+        "le modèle à différentes configurations géométriques des données."
     )
 
     doc.save(save_path)
@@ -596,20 +644,27 @@ def main():
     print(f"\nDataset ({len(df)} samples) saved to {csv_path}")
     print(df.groupby("E").size().rename("count").to_frame())
 
+    # Centre = centroid of class 1 (default) — override here if needed
+    center = compute_default_center(df)
+    print(f"\nCircle centre (centroid of E=1): "
+          f"I₀ = {center[0]:.4f}, F₀ = {center[1]:.4f}")
+
     print("\nFitting optimal circle boundaries ...")
-    radii, error = fit_circle_boundaries(df)
+    radii, error = fit_circle_boundaries(df, center=center)
     accuracy_hard = 1.0 - error
 
     print(f"\nOptimal radii found:")
     for k, r in enumerate(radii):
-        print(f"  r{k+1} = {r:.4f}  →  I² + F² = {r**2:.4f}")
+        print(f"  r{k+1} = {r:.4f}  →  (I-I₀)²+(F-F₀)² = {r**2:.4f}")
     print(f"\nHard classification accuracy: {accuracy_hard:.1%}")
 
-    y_pred = classify_by_radii(df["I"].values, df["F"].values, radii)
+    y_pred = classify_by_radii(df["I"].values, df["F"].values,
+                               radii, center)
     df["E_pred"] = y_pred
 
     print("\nFitting cumulative ordinal logistic model ...")
-    alpha, beta, probs, accuracy_ordinal = fit_ordinal_logistic(df, radii)
+    alpha, beta, probs, accuracy_ordinal = fit_ordinal_logistic(
+        df, radii, center=center)
 
     print(f"\nOrdinal model parameters:")
     for k in range(len(alpha)):
@@ -630,9 +685,11 @@ def main():
     print(df[["I", "F", "E", "P(E=1)", "P(E=2)", "P(E=3)", "P(E=4)"]].head(10)
           .to_string(index=False, float_format="%.4f"))
 
-    plot_boundaries(df, radii, accuracy_hard)
-    plot_ordinal_probabilities(df, radii, alpha, beta, accuracy_ordinal)
-    generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal)
+    plot_boundaries(df, radii, accuracy_hard, center=center)
+    plot_ordinal_probabilities(df, radii, alpha, beta,
+                               accuracy_ordinal, center=center)
+    generate_report(radii, alpha, beta, accuracy_hard, accuracy_ordinal,
+                    center=center)
 
     print("\n" + "=" * 60)
     print("  All outputs generated:")
