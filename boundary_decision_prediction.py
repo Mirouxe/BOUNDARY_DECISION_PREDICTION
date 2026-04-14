@@ -421,9 +421,11 @@ def plot_ordinal_probabilities(df: pd.DataFrame, radii: np.ndarray,
 
     line_styles = ["-", "--", "-.", ":"]
     for k in range(4):
+        ax2.fill_between(r_smooth, probs_smooth[:, k],
+                         color=CLASS_COLORS[k + 1], alpha=0.18, zorder=1)
         ax2.plot(r_smooth, probs_smooth[:, k],
                  color=CLASS_COLORS[k + 1], lw=2.2, ls=line_styles[k],
-                 label=EXPOSURE_LABELS[k + 1])
+                 label=EXPOSURE_LABELS[k + 1], zorder=2)
 
     for rv in radii:
         ax2.axvline(rv, color="grey", lw=0.8, ls=":", alpha=0.6)
